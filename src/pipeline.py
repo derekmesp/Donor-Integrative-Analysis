@@ -1,4 +1,5 @@
 
+from patsy import dmatrices
 import matplotlib.pyplot as plt
 from itertools import combinations
 from scipy import stats
@@ -7,11 +8,23 @@ import pandas as pd
 import logging
 import re
 import statsmodels.formula.api as smf
+import statsmodels.api as sm
 import seaborn as sns
 from statannotations.Annotator import Annotator
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s - %(levelname)s - %(message)s")
+
+publication_palette = {
+    "Hispanic/Latino": "#9ec1df",          # Muted Blue
+    "White": "#fbc599",                    # Muted Orange
+    "Black or African American": "#a8d8b9",  # Muted Green
+    "Asian": "#e6afb9"                     # Muted Rose Pink
+}
+sex_palette = {
+    "MALE": "#9ec1df",
+    "FEMALE": "#fbc599"  # Muted Orange
+}
 
 
 def column_clean(col_name):
@@ -177,7 +190,7 @@ def stat_boxplot(df, population_name, tissue):
         palette=box_palette,
         dodge=False,
         boxprops=dict(alpha=0.4),
-        showfliers=False,
+        showfliers=True,
         ax=ax,
         zorder=1,
     )
@@ -303,7 +316,8 @@ def sex_boxplot(df, population_name, tissue):
         f"Outlier donors for {population_name} in tissue {tissue}: {outlier_str}"
     )
 
-    df_filtered = df[~is_outlier].reset_index(drop=True)
+    # df_filtered = df[~is_outlier].reset_index(drop=True)
+    df_filtered = df
 
     default_colors = sns.color_palette(n_colors=len(unique_sexes))
     box_palette = dict(zip(unique_sexes, default_colors))
@@ -319,7 +333,7 @@ def sex_boxplot(df, population_name, tissue):
         palette=box_palette,
         dodge=False,
         boxprops=dict(alpha=0.4),
-        showfliers=False,
+        showfliers=True,
         ax=ax,
         zorder=1,
     )
@@ -503,4 +517,201 @@ def ols_summary(df):
     plt.legend(title="Demographic Group", title_fontsize="11",
                loc="best", frameon=True, shadow=False)
 
+    plt.show()
+
+
+def visualize_ols_vs_mann_whitney(df, population_name, tissue, target_variable="BMI"):
+    """
+    Generates a 2-panel figure comparing univariable data visualization vs. an 
+    Added Variable Plot (Partial Regression Plot) by bypassing Patsy parsing errors.
+
+    Parameters:
+    -----------
+    df : pd.DataFrame
+        The raw dataset containing demographics and cell markers.
+    population_name : str
+        The raw cell marker name (e.g., 'CD4 CD45RA-CCR7-').
+    tissue : str
+        The tissue string to filter by (e.g., 'MLN').
+    target_variable : str
+        The exact string parameter from your OLS summary. If categorical, 
+        provide the Patsy formatted string (e.g., "C(Sex)[T.MALE]" or 
+        "C(Ethnicity, Treatment(reference='White'))[T.Asian]").
+    """
+    safe_pop = column_clean(population_name)
+    df_working = df.rename(columns={population_name: safe_pop}).copy()
+
+    df_tissue = df_working[df_working["Tissue"] == tissue].dropna(
+        subset=[safe_pop, "Sex", "Ethnicity", "Age", "BMI"]
+    )
+
+    if df_tissue.empty:
+        print(f"No complete data available for tissue {tissue}")
+        return
+
+    formula = f"{safe_pop} ~ C(Sex) + C(Ethnicity, Treatment(reference='White')) + Age + BMI"
+    y, X = dmatrices(formula, data=df_tissue, return_type='dataframe')
+
+    if target_variable not in X.columns:
+        raise ValueError(f"Variable '{target_variable}' not found in model columns. "
+                         f"Available columns are: {list(X.columns)}")
+
+    fig, axes = plt.subplots(1, 2, figsize=(14, 8))
+
+    if "Sex" in target_variable:
+        sns.boxplot(x="Sex", y=safe_pop, data=df_tissue,
+                    ax=axes[0], palette=sex_palette, hue="Sex", legend=False)
+        sns.stripplot(x="Sex", y=safe_pop, data=df_tissue,
+                      ax=axes[0], color="black", alpha=0.6, jitter=True)
+        axes[0].set_title(
+            f"Univariable View: {population_name} by Sex\n(Confounded / Mann-Whitney Null) in {tissue}")
+    elif "Ethnicity" in target_variable:
+        sns.boxplot(x="Ethnicity", y=safe_pop, data=df_tissue,
+                    ax=axes[0], hue="Ethnicity", palette=publication_palette, legend=False)
+        sns.stripplot(x="Ethnicity", y=safe_pop, data=df_tissue,
+                      ax=axes[0], color="black", alpha=0.6, jitter=True)
+        axes[0].set_xticklabels(
+            axes[0].get_xticklabels(), rotation=45, ha='right')
+        axes[0].set_title(
+            f"Univariable View: {population_name} by Ethnicity in {tissue}")
+    else:
+        sns.regplot(x=target_variable, y=safe_pop, data=df_tissue, ax=axes[0],
+                    scatter_kws={'alpha': 0.6, 'color': 'gray'}, line_kws={'color': 'red', 'linestyle': '--'})
+        axes[0].set_title(
+            f"Univariable View: {population_name} vs {target_variable}\n(Unadjusted Structural Noise)")
+        axes[0].set_xlabel(f"Raw {target_variable}")
+
+    axes[0].set_ylabel(f"{population_name} Frequency")
+    full_model = sm.OLS(y, X).fit(cov_type="HC3")
+    beta_coefficient = full_model.params[target_variable]
+    other_cols = [col for col in X.columns if col != target_variable]
+
+    sm.graphics.plot_partregress(
+        endog=y,
+        exog_i=X[target_variable],
+        exog_others=X[other_cols],
+        obs_labels=False,
+        ax=axes[1]
+    )
+
+    clean_label = target_variable.split(
+        '.')[-1].replace(']', '') if '[' in target_variable else target_variable
+    axes[1].set_title(
+        f"Adjusted OLS View: Isolated Effect of {clean_label} in {tissue}\n(OLS β = {beta_coefficient:.3f}, p = {full_model.pvalues[target_variable]:.4f})")
+    axes[1].set_xlabel(f"Residuals of {clean_label}")
+    axes[1].set_ylabel(f"Residuals of {population_name}")
+
+    sns.despine()
+    plt.tight_layout()
+
+    clean_filename = (target_variable
+                      .replace("C(", "")
+                      .replace(")[T.", "_")
+                      .replace("]", "")
+                      .replace(" ", "_")
+                      .replace("/", "_"))
+    plt.savefig(f"{safe_pop}_{tissue}_{clean_filename}_comparison_panel.png",
+                dpi=300, bbox_inches="tight")
+    plt.show()
+
+
+def visualize_ols_vs_mann_whitney_colored(df, population_name, tissue, target_variable="C(Sex)[T.MALE]", color_by="Ethnicity"):
+    """
+    Generates a 2-panel figure comparing raw univariable data vs. an Added Variable Plot,
+    with color-coded data points to expose cohort imbalances and demographic confounding.
+
+    Parameters:
+    -----------
+    df : pd.DataFrame
+        The raw dataset containing demographics and cell markers.
+    population_name : str
+        The raw cell marker name (e.g., 'Treg' or 'CD4 CD45RA-CCR7-').
+    tissue : str
+        The tissue string to filter by (e.g., 'MLN' or 'SPL').
+    target_variable : str
+        The exact string parameter from your OLS summary (e.g., "C(Sex)[T.MALE]" or "BMI").
+    color_by : str
+        The metadata column used to color-code the points (e.g., 'Ethnicity' or 'Tissue').
+    """
+    safe_pop = column_clean(population_name)
+    df_working = df.rename(columns={population_name: safe_pop}).copy()
+
+    df_tissue = df_working[df_working["Tissue"] == tissue].dropna(
+        subset=[safe_pop, "Sex", "Ethnicity", "Age", "BMI", color_by]
+    ).reset_index(drop=True)
+
+    if df_tissue.empty:
+        print(f"No complete data available for tissue {tissue}")
+        return
+
+    formula = f"{safe_pop} ~ C(Sex) + C(Ethnicity, Treatment(reference='White')) + Age + BMI"
+    y, X = dmatrices(formula, data=df_tissue, return_type='dataframe')
+
+    if target_variable not in X.columns:
+        raise ValueError(
+            f"Variable '{target_variable}' not found. Choose from: {list(X.columns)}")
+
+    other_cols = [col for col in X.columns if col != target_variable]
+    model_y = sm.OLS(y, X[other_cols]).fit()
+    y_residuals = model_y.resid
+
+    model_x = sm.OLS(X[target_variable], X[other_cols]).fit()
+    x_residuals = model_x.resid
+
+    df_res = pd.DataFrame({
+        "X_res": x_residuals,
+        "Y_res": y_residuals,
+        "Color_Group": df_tissue[color_by],
+        "Sex": df_tissue["Sex"]
+    })
+
+    fig, axes = plt.subplots(1, 2, figsize=(15, 6.5))
+
+    unique_groups = sorted(df_tissue[color_by].unique())
+    custom_palette = dict(
+        zip(unique_groups, sns.color_palette("Set2", len(unique_groups))))
+
+    if "Sex" in target_variable:
+        sns.boxplot(x="Sex", y=safe_pop, data=df_tissue,
+                    ax=axes[0], palette=sex_palette, hue="Sex", legend=False, showfliers=False)
+        sns.stripplot(x="Sex", y=safe_pop, hue=color_by, data=df_tissue,
+                      ax=axes[0], palette=custom_palette, alpha=0.8, jitter=True, size=7, edgecolor="black", linewidth=0.5)
+        axes[0].set_title(
+            f"Univariable View: {population_name} by Sex\n(Confounded / Overlapping Variance) in {tissue}")
+    else:
+        sns.scatterplot(x=target_variable, y=safe_pop, hue=color_by, data=df_tissue,
+                        ax=axes[0], palette=custom_palette, s=70, edgecolor="black", alpha=0.8)
+        axes[0].set_title(
+            f"Univariable View: {population_name} vs {target_variable}")
+
+    axes[0].set_ylabel(f"{population_name} Frequency")
+    axes[0].legend(title=color_by, bbox_to_anchor=(1.02, 1), loc='upper left')
+
+    full_model = sm.OLS(y, X).fit(cov_type="HC3")
+    beta_coefficient = full_model.params[target_variable]
+    intercept = 0
+
+    line_x = [x_residuals.min(), x_residuals.max()]
+    line_y = [intercept + beta_coefficient * x for x in line_x]
+    axes[1].plot(line_x, line_y, color="black",
+                 linestyle="-", linewidth=1.5, zorder=1)
+
+    sns.scatterplot(
+        x="X_res", y="Y_res", hue="Color_Group", data=df_res, ax=axes[1],
+        palette=custom_palette, s=80, edgecolor="black", alpha=0.9, zorder=2
+    )
+
+    clean_label = target_variable.split(
+        '.')[-1].replace(']', '') if '[' in target_variable else target_variable
+    axes[1].set_title(
+        f"Adjusted OLS View: Isolated Effect of {clean_label} in {tissue}\n(OLS β = {beta_coefficient:.3f}, p = {full_model.pvalues[target_variable]:.4f})")
+    axes[1].set_xlabel(f"Residuals of {clean_label}")
+    axes[1].set_ylabel(f"Residuals of {population_name}")
+    axes[1].get_legend().remove()
+
+    sns.despine()
+    plt.tight_layout()
+
+    plt.savefig(f"{safe_pop}_{tissue}_{color_by}_colored_panel.png",
+                dpi=300, bbox_inches="tight")
     plt.show()
