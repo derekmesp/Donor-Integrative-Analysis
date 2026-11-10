@@ -1,6 +1,7 @@
 
 from patsy import dmatrices
 import matplotlib.pyplot as plt
+from matplotlib.patches import Patch
 from itertools import combinations
 from scipy import stats
 from matplotlib import pyplot as plt
@@ -9,6 +10,7 @@ import logging
 import re
 import statsmodels.formula.api as smf
 import statsmodels.api as sm
+from statsmodels.stats.multitest import multipletests
 import seaborn as sns
 from statannotations.Annotator import Annotator
 
@@ -25,6 +27,140 @@ sex_palette = {
     "MALE": "#9ec1df",
     "FEMALE": "#fbc599"  # Muted Orange
 }
+
+
+def summarize_categorical_data(df, columns=None, include_missing=True):
+    """
+    Summarizes categorical data in a DataFrame, providing counts and percentages for each category.
+
+    Parameters:
+    -----------
+    df : pd.DataFrame
+        The input DataFrame containing categorical data.
+    columns : list, optional
+        List of column names to summarize. If None, object, category, and boolean columns are summarized,
+        except for the Donor identifier.
+    include_missing : bool, optional
+        Whether to include missing values in the summary. Default is True. For Sex and Ethnicity,
+        percentages use unique donors; conflicting labels are counted in each observed category and logged.
+
+    Returns:
+    --------
+    pd.DataFrame
+        A DataFrame containing the summary of categorical data with columns: 'Variable', 'Category',
+        'Count', and 'Percent'.
+    """
+    if columns is None:
+        columns = [
+            col for col in df.select_dtypes(include=["object", "category", "bool"]).columns
+            if col.lower() != "donor"
+        ]
+
+    rows = []
+    for column in columns:
+        demographic = column.strip().rstrip(":").strip()
+        if demographic in {"Sex", "Ethnicity"}:
+            if "Donor" not in df.columns:
+                raise ValueError(
+                    f"A Donor column is required to summarize {demographic} by unique donor")
+
+            donor_values = df[["Donor", column]].copy()
+            donor_values["Donor"] = (
+                donor_values["Donor"].astype("string").str.strip())
+            donor_values[column] = donor_values[column].map(
+                lambda value: value.strip() if isinstance(value, str) else value)
+            donor_values = donor_values.dropna(subset=["Donor"])
+            donor_categories = donor_values.groupby(
+                "Donor", sort=False)[column].agg(
+                    lambda values: list(pd.unique(values.dropna())))
+            conflicting_donors = donor_categories[
+                donor_categories.map(len) > 1].index.tolist()
+            if conflicting_donors:
+                logging.warning(
+                    "Donors with multiple %s labels are counted once in each label: %s",
+                    demographic, conflicting_donors)
+
+            categories = []
+            for donor_labels in donor_categories:
+                categories.extend(donor_labels or ["(Missing)"])
+            counts = pd.Series(categories, dtype="object").value_counts()
+            denominator = (
+                len(donor_categories) if include_missing
+                else donor_categories.map(bool).sum()
+            )
+            if not include_missing:
+                counts = counts.drop("(Missing)", errors="ignore")
+        else:
+            counts = df[column].value_counts(dropna=include_missing)
+            denominator = len(
+                df) if include_missing else df[column].notna().sum()
+
+        for category, count in counts.items():
+            rows.append({
+                "Variable": demographic if demographic in {"Sex", "Ethnicity"} else column,
+                "Category": "(Missing)" if pd.isna(category) else category,
+                "Count": int(count),
+                "Percent": (100 * count / denominator) if denominator else 0.0,
+            })
+
+    return pd.DataFrame(rows, columns=["Variable", "Category", "Count", "Percent"])
+
+
+def plot_categorical_summary(categorical_summary, variables=None):
+    """
+    Plot category counts as one pie chart per variable.
+
+    Parameters:
+    -----------
+    categorical_summary : pd.DataFrame
+        A DataFrame containing the summary of categorical data with columns: 'Variable', 'Category',
+        'Count', and 'Percent'.
+    variables : list, optional
+        List of variable names to plot. If None, all variables in the summary are plotted.
+
+    Returns:
+    --------
+    matplotlib.figure.Figure
+        The figure object containing the generated plots.
+
+    """
+    required = {"Variable", "Category", "Count"}
+    missing = required.difference(categorical_summary.columns)
+    if missing:
+        raise ValueError(
+            f"Categorical summary is missing required columns: {sorted(missing)}")
+
+    if variables is None:
+        variables = categorical_summary["Variable"].drop_duplicates().tolist()
+    plot_data = categorical_summary[
+        categorical_summary["Variable"].isin(variables)]
+    variables = [v for v in variables if v in plot_data["Variable"].values]
+    if not variables:
+        raise ValueError("No requested variables are present in the summary")
+
+    fig, axes = plt.subplots(
+        nrows=1, ncols=len(variables), figsize=(6 * len(variables), 6),
+        squeeze=False)
+    for ax, variable in zip(axes[0], variables):
+        data = plot_data[plot_data["Variable"]
+                         == variable].sort_values("Count")
+        counts = data["Count"].to_numpy()
+        categories = data["Category"].astype(str).to_numpy()
+        wedges, _, _ = ax.pie(
+            counts, startangle=90, autopct="%1.1f%%", pctdistance=0.72,
+            textprops={"fontsize": 9})
+        ax.legend(
+            wedges,
+            [f"{category} (n={count})" for category,
+             count in zip(categories, counts)],
+            title=variable, loc="center left", bbox_to_anchor=(1, 0.5),
+            fontsize=8)
+        ax.set_title(variable)
+        ax.axis("equal")
+
+    fig.tight_layout()
+    plt.show()
+    return fig
 
 
 def column_clean(col_name):
@@ -79,6 +215,9 @@ def analyze_tissue_demographics(df, subset_columns, min_samples=20, alpha=0.05):
 
     reverse_mapping = {v: k for k, v in name_mapping.items()}
     df_working = df.rename(columns=name_mapping).copy()
+    for safe_subset in safe_subsets:
+        df_working[safe_subset] = pd.to_numeric(
+            df_working[safe_subset], errors="coerce")
 
     all_results = []
 
@@ -94,9 +233,37 @@ def analyze_tissue_demographics(df, subset_columns, min_samples=20, alpha=0.05):
         for t in tissues:
             tissue_df = df_subset_clean[df_subset_clean["Tissue"] == t]
 
+            ethnicity_counts = tissue_df["Ethnicity"].value_counts()
+            singleton_ethnicity_mask = (
+                tissue_df["Ethnicity"].map(ethnicity_counts).eq(1)
+                & tissue_df["Ethnicity"].ne("White")
+            )
+            if singleton_ethnicity_mask.any():
+                removed_rows = tissue_df.index[singleton_ethnicity_mask].tolist(
+                )
+                removed_ethnicities = tissue_df.loc[
+                    singleton_ethnicity_mask, "Ethnicity"].tolist()
+                logging.warning(
+                    "Excluding singleton non-reference ethnicity observation(s) "
+                    "for %s in tissue %s: %s",
+                    original_name, t,
+                    list(zip(removed_rows, removed_ethnicities)))
+                tissue_df = tissue_df.loc[~singleton_ethnicity_mask]
+
             if len(tissue_df) >= min_samples:
                 try:
-                    formula = f"{safe_subset} ~ C(Sex) + C(Ethnicity, Treatment(reference='White')) + Age + BMI"
+                    formula = f"{safe_subset} ~ C(Sex, Treatment(reference='MALE')) + C(Ethnicity, Treatment(reference='White')) + Age + BMI"
+
+                    preliminary_model = smf.ols(
+                        formula, data=tissue_df).fit()
+                    leverage = preliminary_model.get_influence().hat_matrix_diag
+                    high_leverage_rows = tissue_df.index[leverage >= 1 - 1e-10]
+                    if len(high_leverage_rows):
+                        logging.warning(
+                            "Skipping model for %s in tissue %s: "
+                            "observation(s) %s have leverage 1, so HC3 covariance is undefined",
+                            original_name, t, high_leverage_rows.tolist())
+                        continue
 
                     model = smf.ols(formula, data=tissue_df).fit(
                         cov_type="HC3")
@@ -111,7 +278,7 @@ def analyze_tissue_demographics(df, subset_columns, min_samples=20, alpha=0.05):
                             continue
 
                         clean_coef_label = (coef_name
-                                            .replace("C(Sex)[T.", "Sex: ")
+                                            .replace("C(Sex, Treatment(reference='MALE'))[T.", "Sex: ")
                                             .replace("C(Ethnicity, Treatment(reference='White'))[T.", "Ethnicity: ")
                                             .replace("]", ""))
 
@@ -131,7 +298,19 @@ def analyze_tissue_demographics(df, subset_columns, min_samples=20, alpha=0.05):
                     logging.warning(
                         f"Could not compute model for {original_name} in tissue {t}: {str(e)}")
 
-    return pd.DataFrame(all_results)
+    results = pd.DataFrame(all_results)
+    if not results.empty:
+        valid_pvalues = results["p_value"].notna()
+        results["p_value_FDR"] = float("nan")
+        if valid_pvalues.any():
+            results.loc[valid_pvalues, "p_value_FDR"] = multipletests(
+                results.loc[valid_pvalues, "p_value"],
+                alpha=alpha,
+                method="fdr_bh",
+            )[1]
+        results["Is_Significant_FDR"] = results["p_value_FDR"] < alpha
+
+    return results
 
 
 def stat_boxplot(df, population_name, tissue):
@@ -159,14 +338,29 @@ def stat_boxplot(df, population_name, tissue):
         logging.warning(f"No data available for tissue {tissue}")
         return
 
+    ethnicity_counts = df["Ethnicity"].value_counts()
+    excluded_ethnicities = ethnicity_counts[ethnicity_counts < 2].index.tolist()
+    if excluded_ethnicities:
+        logging.info(
+            "Excluding ethnicity groups with fewer than 2 observations "
+            "for %s in tissue %s: %s",
+            population_name, tissue, excluded_ethnicities)
+        df = df[~df["Ethnicity"].isin(excluded_ethnicities)].copy()
+
+    if df.empty:
+        logging.warning(
+            "No ethnicity groups have at least 2 observations for %s in tissue %s",
+            population_name, tissue)
+        return
+
     unique_ethnicities = list(df["Ethnicity"].unique())
 
-    is_outlier = (
-        df.groupby("Ethnicity")[population_name]
-        .transform(lambda x: (x - x.mean()).abs() > 2 * x.std())
-        .fillna(False)
-        .astype(bool)
-    )
+    grouped_values = df.groupby("Ethnicity")[population_name]
+    q1 = grouped_values.transform(lambda values: values.quantile(0.25))
+    q3 = grouped_values.transform(lambda values: values.quantile(0.75))
+    iqr = q3 - q1
+    is_outlier = ((df[population_name] < q1 - 1.5 * iqr)
+                  | (df[population_name] > q3 + 1.5 * iqr))
 
     outlier_donors = df[is_outlier]["Donor"].unique()
     outlier_str = ", ".join(map(str, outlier_donors))
@@ -174,12 +368,12 @@ def stat_boxplot(df, population_name, tissue):
         f"Outlier donors for {population_name} in tissue {tissue}: {outlier_str}"
     )
 
-    df_filtered = df[~is_outlier].reset_index(drop=True)
+    df_filtered = df
 
     default_colors = sns.color_palette(n_colors=len(unique_ethnicities))
     box_palette = dict(zip(unique_ethnicities, default_colors))
 
-    fig, ax = plt.subplots(figsize=(8, 8))
+    fig, ax = plt.subplots(figsize=(10, 8))
 
     sns.boxplot(
         x="Ethnicity",
@@ -191,6 +385,12 @@ def stat_boxplot(df, population_name, tissue):
         dodge=False,
         boxprops=dict(alpha=0.4),
         showfliers=True,
+        flierprops={
+            "marker": "o",
+            "markerfacecolor": "white",
+            "markeredgecolor": "black",
+            "markersize": 6,
+        },
         ax=ax,
         zorder=1,
     )
@@ -211,7 +411,7 @@ def stat_boxplot(df, population_name, tissue):
     sns.stripplot(
         x="Ethnicity",
         y=population_name,
-        data=df_filtered,
+        data=df_filtered.loc[~is_outlier],
         hue="Ethnicity",
         order=unique_ethnicities,
         palette=box_palette,
@@ -224,13 +424,8 @@ def stat_boxplot(df, population_name, tissue):
         zorder=3,
     )
 
-    ethnicity_counts = df_filtered["Ethnicity"].value_counts()
-    valid_ethnicities = [
-        eth for eth in unique_ethnicities if ethnicity_counts[eth] >= 2
-    ]
-
-    if len(valid_ethnicities) >= 2:
-        pairs = list(combinations(valid_ethnicities, 2))
+    if len(unique_ethnicities) >= 2:
+        pairs = list(combinations(unique_ethnicities, 2))
         annotator = Annotator(
             ax,
             pairs,
@@ -242,7 +437,7 @@ def stat_boxplot(df, population_name, tissue):
         annotator.configure(
             test="Mann-Whitney",
             text_format="star",
-            loc="inside",
+            loc="outside",
             comparisons_correction="bonferroni",
             line_width=1.2,
             hide_non_significant=True,
@@ -262,12 +457,33 @@ def stat_boxplot(df, population_name, tissue):
             f"Not enough valid ethnicities for statistical comparison in {population_name} for tissue {tissue}."
         )
 
+    ethnicity_positions = {
+        ethnicity: position
+        for position, ethnicity in enumerate(unique_ethnicities)
+    }
+    for ethnicity, outliers in df.loc[is_outlier].groupby("Ethnicity", sort=False):
+        outliers = outliers.sort_values(population_name)
+        for index, (_, outlier) in enumerate(outliers.iterrows()):
+            to_right = index % 2 == 0
+            ax.annotate(
+                str(outlier["Donor"]),
+                xy=(ethnicity_positions[ethnicity], outlier[population_name]),
+                xytext=(10 if to_right else -10, 5 * (index // 2)),
+                textcoords="offset points",
+                ha="left" if to_right else "right",
+                va="center",
+                fontsize=8,
+                arrowprops={"arrowstyle": "-", "color": "gray", "lw": 0.7},
+                annotation_clip=False,
+                zorder=5,
+            )
+
     plt.xticks(rotation=45, ha="right", fontsize=12)
     plt.yticks(fontsize=10)
-    plt.title(f"{population_name} in {tissue}", fontsize=14)
+    ax.set_title(f"{population_name} in {tissue}", fontsize=14, pad=38)
 
     sns.despine()
-    plt.tight_layout()
+    fig.tight_layout(rect=(0, 0, 0.82, 0.9))
 
     plt.savefig(
         f"{population_name}_{tissue}_boxplot.png", dpi=300, bbox_inches="tight"
@@ -481,13 +697,23 @@ def ols_summary(df):
     None
     """
 
+    df = df[df["Demographic_Variable"] != "BMI"].copy()
+    if df.empty:
+        logging.warning("No FDR-significant OLS results to plot.")
+        return
+
     df["Label"] = df["Subset"] + \
         " (" + df["Tissue"] + ")"
 
     df = df.sort_values(
         by=["Demographic_Variable", "Coefficient"], ascending=[True, True])
 
-    plt.figure(figsize=(11, 8))
+    figure_height = max(
+        8,
+        0.55 * df["Subset"].nunique(),
+        0.3 * df["Label"].nunique(),
+    )
+    plt.figure(figsize=(11, figure_height))
     sns.set_theme(style="whitegrid")
 
     ax = sns.scatterplot(
@@ -503,8 +729,8 @@ def ols_summary(df):
     )
 
     plt.axvline(x=0, color="black", linestyle="--", linewidth=1.5,
-                alpha=0.7, label="Baseline (White/Female)")
-    plt.title("Tissue-Stratified OLS Demographic Coefficients on T-Cell Subsets\n(All points represent statistically significant changes, p < 0.05)",
+                alpha=0.7, label="Baseline (White/Male)")
+    plt.title("Tissue-Stratified OLS Demographic Coefficients on T-Cell Subsets\n(All points pass Benjamini-Hochberg correction, q < 0.05)",
               fontsize=14, fontweight="bold", pad=15)
     plt.xlabel("Regression Coefficient (Effect Size)",
                fontsize=12, labelpad=10)
@@ -520,7 +746,9 @@ def ols_summary(df):
     plt.show()
 
 
-def visualize_ols_vs_mann_whitney(df, population_name, tissue, target_variable="BMI"):
+def visualize_ols_vs_mann_whitney(
+        df, population_name, tissue, target_variable="BMI",
+        adjusted_p_value=None):
     """
     Generates a 2-panel figure comparing univariable data visualization vs. an 
     Added Variable Plot (Partial Regression Plot) by bypassing Patsy parsing errors.
@@ -535,8 +763,10 @@ def visualize_ols_vs_mann_whitney(df, population_name, tissue, target_variable="
         The tissue string to filter by (e.g., 'MLN').
     target_variable : str
         The exact string parameter from your OLS summary. If categorical, 
-        provide the Patsy formatted string (e.g., "C(Sex)[T.MALE]" or 
+        provide the Patsy formatted string (e.g., "C(Sex, Treatment(reference='MALE'))[T.FEMALE]" or 
         "C(Ethnicity, Treatment(reference='White'))[T.Asian]").
+    adjusted_p_value : float, optional
+        Multiple-testing-adjusted p-value from the full analysis, if available.
     """
     safe_pop = column_clean(population_name)
     df_working = df.rename(columns={population_name: safe_pop}).copy()
@@ -549,7 +779,7 @@ def visualize_ols_vs_mann_whitney(df, population_name, tissue, target_variable="
         print(f"No complete data available for tissue {tissue}")
         return
 
-    formula = f"{safe_pop} ~ C(Sex) + C(Ethnicity, Treatment(reference='White')) + Age + BMI"
+    formula = f"{safe_pop} ~ C(Sex, Treatment(reference='MALE')) + C(Ethnicity, Treatment(reference='White')) + Age + BMI"
     y, X = dmatrices(formula, data=df_tissue, return_type='dataframe')
 
     if target_variable not in X.columns:
@@ -565,13 +795,21 @@ def visualize_ols_vs_mann_whitney(df, population_name, tissue, target_variable="
                       ax=axes[0], color="black", alpha=0.6, jitter=True)
         axes[0].set_title(
             f"Univariable View: {population_name} by Sex\n(Confounded / Mann-Whitney Null) in {tissue}")
+        sex_counts = df_tissue.groupby("Sex")["Donor"].nunique()
+        axes[0].set_xticklabels([
+            f"{label.get_text()}\n(n={sex_counts.get(label.get_text(), 0)})"
+            for label in axes[0].get_xticklabels()
+        ])
     elif "Ethnicity" in target_variable:
         sns.boxplot(x="Ethnicity", y=safe_pop, data=df_tissue,
                     ax=axes[0], hue="Ethnicity", palette=publication_palette, legend=False)
         sns.stripplot(x="Ethnicity", y=safe_pop, data=df_tissue,
                       ax=axes[0], color="black", alpha=0.6, jitter=True)
-        axes[0].set_xticklabels(
-            axes[0].get_xticklabels(), rotation=45, ha='right')
+        ethnicity_counts = df_tissue.groupby("Ethnicity")["Donor"].nunique()
+        axes[0].set_xticklabels([
+            f"{label.get_text()}\n(n={ethnicity_counts.get(label.get_text(), 0)})"
+            for label in axes[0].get_xticklabels()
+        ], rotation=45, ha='right')
         axes[0].set_title(
             f"Univariable View: {population_name} by Ethnicity in {tissue}")
     else:
@@ -584,6 +822,19 @@ def visualize_ols_vs_mann_whitney(df, population_name, tissue, target_variable="
     axes[0].set_ylabel(f"{population_name} Frequency")
     full_model = sm.OLS(y, X).fit(cov_type="HC3")
     beta_coefficient = full_model.params[target_variable]
+    confidence_interval = full_model.conf_int().loc[target_variable]
+    ethnicity_columns = [
+        col for col in X.columns
+        if col.startswith("C(Ethnicity, Treatment(reference='White'))[T.")
+    ]
+    ethnicity_omnibus_p = None
+    if ethnicity_columns:
+        restrictions = pd.DataFrame(0.0, index=range(len(ethnicity_columns)),
+                                    columns=X.columns)
+        for row, column in enumerate(ethnicity_columns):
+            restrictions.loc[row, column] = 1.0
+        ethnicity_omnibus_p = float(full_model.f_test(restrictions).pvalue)
+
     other_cols = [col for col in X.columns if col != target_variable]
 
     sm.graphics.plot_partregress(
@@ -594,10 +845,23 @@ def visualize_ols_vs_mann_whitney(df, population_name, tissue, target_variable="
         ax=axes[1]
     )
 
-    clean_label = target_variable.split(
-        '.')[-1].replace(']', '') if '[' in target_variable else target_variable
+    clean_label = (
+        target_variable.rsplit("[T.", 1)[1].rstrip("]")
+        if "[T." in target_variable else target_variable
+    )
+    contrast = " vs White" if "Ethnicity" in target_variable else (
+        " vs Male" if "Sex" in target_variable else "")
+    p_label = f"raw p = {full_model.pvalues[target_variable]:.4f}"
+    if adjusted_p_value is not None:
+        p_label += f", BH q = {adjusted_p_value:.4f}"
+    omnibus_label = (
+        f"; ethnicity omnibus raw p = {ethnicity_omnibus_p:.4f}"
+        if ethnicity_omnibus_p is not None else ""
+    )
     axes[1].set_title(
-        f"Adjusted OLS View: Isolated Effect of {clean_label} in {tissue}\n(OLS β = {beta_coefficient:.3f}, p = {full_model.pvalues[target_variable]:.4f})")
+        f"Adjusted OLS: {clean_label}{contrast} in {tissue}\n"
+        f"β = {beta_coefficient:.2f}, 95% CI [{confidence_interval.iloc[0]:.2f}, "
+        f"{confidence_interval.iloc[1]:.2f}], {p_label}{omnibus_label}")
     axes[1].set_xlabel(f"Residuals of {clean_label}")
     axes[1].set_ylabel(f"Residuals of {population_name}")
 
@@ -615,7 +879,7 @@ def visualize_ols_vs_mann_whitney(df, population_name, tissue, target_variable="
     plt.show()
 
 
-def visualize_ols_vs_mann_whitney_colored(df, population_name, tissue, target_variable="C(Sex)[T.MALE]", color_by="Ethnicity"):
+def visualize_ols_vs_mann_whitney_colored(df, population_name, tissue, target_variable="C(Sex, Treatment(reference='MALE'))[T.FEMALE]", color_by="Ethnicity"):
     """
     Generates a 2-panel figure comparing raw univariable data vs. an Added Variable Plot,
     with color-coded data points to expose cohort imbalances and demographic confounding.
@@ -629,7 +893,7 @@ def visualize_ols_vs_mann_whitney_colored(df, population_name, tissue, target_va
     tissue : str
         The tissue string to filter by (e.g., 'MLN' or 'SPL').
     target_variable : str
-        The exact string parameter from your OLS summary (e.g., "C(Sex)[T.MALE]" or "BMI").
+        The exact string parameter from your OLS summary (e.g., "C(Sex, Treatment(reference='MALE'))[T.FEMALE]" or "BMI").
     color_by : str
         The metadata column used to color-code the points (e.g., 'Ethnicity' or 'Tissue').
     """
@@ -644,7 +908,7 @@ def visualize_ols_vs_mann_whitney_colored(df, population_name, tissue, target_va
         print(f"No complete data available for tissue {tissue}")
         return
 
-    formula = f"{safe_pop} ~ C(Sex) + C(Ethnicity, Treatment(reference='White')) + Age + BMI"
+    formula = f"{safe_pop} ~ C(Sex, Treatment(reference='MALE')) + C(Ethnicity, Treatment(reference='White')) + Age + BMI"
     y, X = dmatrices(formula, data=df_tissue, return_type='dataframe')
 
     if target_variable not in X.columns:
