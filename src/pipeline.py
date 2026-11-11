@@ -1,11 +1,11 @@
 
-from patsy import dmatrices
+from patsy import build_design_matrices, dmatrices
 import matplotlib.pyplot as plt
-from matplotlib.patches import Patch
 from itertools import combinations
 from scipy import stats
 from matplotlib import pyplot as plt
 import pandas as pd
+import numpy as np
 import logging
 import re
 import statsmodels.formula.api as smf
@@ -18,15 +18,24 @@ logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s - %(levelname)s - %(message)s")
 
 publication_palette = {
-    "Hispanic/Latino": "#9ec1df",          # Muted Blue
-    "White": "#fbc599",                    # Muted Orange
-    "Black or African American": "#a8d8b9",  # Muted Green
-    "Asian": "#e6afb9"                     # Muted Rose Pink
+    "Hispanic/Latino": "#1762a4",          # Muted Blue
+    "White": "#bd6319",                    # Muted Orange
+    "Black or African American": "#1cb251",  # Muted Green
+    "Asian": "#97182f"                     # Muted Rose Pink
 }
 sex_palette = {
-    "MALE": "#9ec1df",
-    "FEMALE": "#fbc599"  # Muted Orange
+    "MALE": "#0c6e97",
+    "FEMALE": "#84109e"  # Muted Orange
 }
+
+
+def _palette_for_categories(categories, base_palette):
+    """Keep known category colors fixed and fill missing categories consistently."""
+    extra_categories = sorted(set(categories).difference(base_palette))
+    extra_colors = sns.color_palette("husl", n_colors=len(extra_categories))
+    palette = dict(base_palette)
+    palette.update(dict(zip(extra_categories, extra_colors)))
+    return {category: palette[category] for category in categories}
 
 
 def summarize_categorical_data(df, columns=None, include_missing=True):
@@ -313,6 +322,140 @@ def analyze_tissue_demographics(df, subset_columns, min_samples=20, alpha=0.05):
     return results
 
 
+def analyze_tissue_demographic_group_combinations(
+        df, subset_columns, min_samples=20, alpha=0.05):
+    """Compare every observed sex-by-ethnicity group pair within each tissue.
+
+    The model treats each Sex × Ethnicity combination as a group and adjusts
+    for Age and BMI. Groups with fewer than two complete observations are
+    excluded. Each reported coefficient is Comparison_Group minus
+    Reference_Group. Both directions are returned for every pair, while BH
+    correction is applied once per unique pair and shared by its two rows.
+    """
+    demographics = ["Age", "BMI", "Sex", "Ethnicity", "Tissue"]
+    name_mapping = {col: column_clean(col) for col in subset_columns}
+    reverse_mapping = {safe: original for original,
+                       safe in name_mapping.items()}
+    df_working = df.rename(columns=name_mapping).copy()
+    safe_subsets = list(name_mapping.values())
+
+    for safe_subset in safe_subsets:
+        df_working[safe_subset] = pd.to_numeric(
+            df_working[safe_subset], errors="coerce")
+
+    all_results = []
+    for safe_subset in safe_subsets:
+        original_name = reverse_mapping[safe_subset]
+        features = demographics + [safe_subset]
+        clean_df = df_working[features].dropna().copy()
+        clean_df["Sex"] = clean_df["Sex"].astype("string").str.strip()
+        clean_df["Ethnicity"] = clean_df["Ethnicity"].astype(
+            "string").str.strip()
+
+        for tissue, tissue_df in clean_df.groupby("Tissue", sort=False):
+            tissue_df = tissue_df.copy()
+            tissue_df["Demographic_Group"] = (
+                tissue_df["Sex"] + " / " + tissue_df["Ethnicity"])
+            group_counts = tissue_df["Demographic_Group"].value_counts()
+            rare_groups = group_counts[group_counts < 2].index.tolist()
+            if rare_groups:
+                logging.warning(
+                    "Excluding sex/ethnicity groups with fewer than 2 observations "
+                    "for %s in tissue %s: %s",
+                    original_name, tissue, rare_groups)
+                tissue_df = tissue_df[
+                    ~tissue_df["Demographic_Group"].isin(rare_groups)].copy()
+                group_counts = tissue_df["Demographic_Group"].value_counts()
+
+            groups = sorted(group_counts.index.tolist())
+            if len(tissue_df) < min_samples or len(groups) < 2:
+                continue
+
+            reference = groups[0]
+            formula = (
+                f'{safe_subset} ~ C(Demographic_Group, '
+                f'Treatment(reference={reference!r})) + Age + BMI'
+            )
+            try:
+                preliminary_model = smf.ols(formula, data=tissue_df).fit()
+                leverage = preliminary_model.get_influence().hat_matrix_diag
+                high_leverage = tissue_df.index[leverage >= 1 - 1e-10]
+                if len(high_leverage):
+                    logging.warning(
+                        "Skipping group-combination model for %s in tissue %s: "
+                        "observation(s) %s have leverage 1",
+                        original_name, tissue, high_leverage.tolist())
+                    continue
+
+                model = smf.ols(formula, data=tissue_df).fit(cov_type="HC3")
+                group_design = build_design_matrices(
+                    [model.model.data.design_info],
+                    pd.DataFrame({
+                        "Demographic_Group": groups,
+                        "Age": [0.0] * len(groups),
+                        "BMI": [0.0] * len(groups),
+                    }, index=groups),
+                    return_type="dataframe",
+                )[0]
+
+                for reference_group in groups:
+                    for comparison_group in groups:
+                        if comparison_group == reference_group:
+                            continue
+                        contrast = (
+                            group_design.loc[comparison_group]
+                            - group_design.loc[reference_group]
+                        ).to_numpy()
+                        test = model.t_test(contrast)
+                        confidence_interval = np.asarray(
+                            test.conf_int()).reshape(-1, 2)[0]
+                        all_results.append({
+                            "Subset": original_name,
+                            "Tissue": tissue,
+                            "N_Samples": len(tissue_df),
+                            "Reference_Group": reference_group,
+                            "N_Reference": int(group_counts[reference_group]),
+                            "Comparison_Group": comparison_group,
+                            "N_Comparison": int(group_counts[comparison_group]),
+                            "Coefficient": float(np.asarray(test.effect).item()),
+                            "Std_Err": float(np.asarray(test.sd).item()),
+                            "p_value": float(np.asarray(test.pvalue).item()),
+                            "CI_Lower": float(confidence_interval[0]),
+                            "CI_Upper": float(confidence_interval[1]),
+                        })
+            except Exception as e:
+                logging.warning(
+                    "Could not compute group-combination model for %s in tissue %s: %s",
+                    original_name, tissue, e)
+
+    result_columns = [
+        "Subset", "Tissue", "N_Samples", "Reference_Group", "N_Reference",
+        "Comparison_Group", "N_Comparison", "Coefficient", "Std_Err",
+        "p_value", "CI_Lower", "CI_Upper",
+    ]
+    results = pd.DataFrame(all_results, columns=result_columns)
+    results["p_value_FDR"] = float("nan")
+    results["Is_Significant_FDR"] = False
+    if not results.empty:
+        results["_pair_key"] = results.apply(
+            lambda row: (
+                row["Subset"], row["Tissue"],
+                *sorted([row["Reference_Group"], row["Comparison_Group"]])
+            ),
+            axis=1,
+        )
+        unique_pairs = results.drop_duplicates("_pair_key")
+        valid_pairs = unique_pairs[unique_pairs["p_value"].notna()]
+        if not valid_pairs.empty:
+            corrected_pvalues = multipletests(
+                valid_pairs["p_value"], alpha=alpha, method="fdr_bh")[1]
+            fdr_lookup = dict(zip(valid_pairs["_pair_key"], corrected_pvalues))
+            results["p_value_FDR"] = results["_pair_key"].map(fdr_lookup)
+        results["Is_Significant_FDR"] = results["p_value_FDR"] < alpha
+        results = results.drop(columns="_pair_key")
+    return results
+
+
 def stat_boxplot(df, population_name, tissue):
     """
     Generates a boxplot for a specified population across different ethnicities within a given tissue.
@@ -339,7 +482,8 @@ def stat_boxplot(df, population_name, tissue):
         return
 
     ethnicity_counts = df["Ethnicity"].value_counts()
-    excluded_ethnicities = ethnicity_counts[ethnicity_counts < 2].index.tolist()
+    excluded_ethnicities = ethnicity_counts[ethnicity_counts < 2].index.tolist(
+    )
     if excluded_ethnicities:
         logging.info(
             "Excluding ethnicity groups with fewer than 2 observations "
@@ -370,8 +514,8 @@ def stat_boxplot(df, population_name, tissue):
 
     df_filtered = df
 
-    default_colors = sns.color_palette(n_colors=len(unique_ethnicities))
-    box_palette = dict(zip(unique_ethnicities, default_colors))
+    box_palette = _palette_for_categories(
+        unique_ethnicities, publication_palette)
 
     fig, ax = plt.subplots(figsize=(10, 8))
 
@@ -478,7 +622,13 @@ def stat_boxplot(df, population_name, tissue):
                 zorder=5,
             )
 
-    plt.xticks(rotation=45, ha="right", fontsize=12)
+    ethnicity_donor_counts = df_filtered.groupby("Ethnicity")[
+        "Donor"].nunique()
+    ax.set_xticks(range(len(unique_ethnicities)))
+    ax.set_xticklabels(
+        [f"{ethnicity}\n(n={ethnicity_donor_counts.get(ethnicity, 0)})"
+         for ethnicity in unique_ethnicities],
+        rotation=45, ha="right", fontsize=12)
     plt.yticks(fontsize=10)
     ax.set_title(f"{population_name} in {tissue}", fontsize=14, pad=38)
 
@@ -519,12 +669,12 @@ def sex_boxplot(df, population_name, tissue):
 
     unique_sexes = list(df["Sex"].unique())
 
-    is_outlier = (
-        df.groupby("Sex")[population_name]
-        .transform(lambda x: (x - x.mean()).abs() > 2 * x.std())
-        .fillna(False)
-        .astype(bool)
-    )
+    grouped_values = df.groupby("Sex")[population_name]
+    q1 = grouped_values.transform(lambda values: values.quantile(0.25))
+    q3 = grouped_values.transform(lambda values: values.quantile(0.75))
+    iqr = q3 - q1
+    is_outlier = ((df[population_name] < q1 - 1.5 * iqr)
+                  | (df[population_name] > q3 + 1.5 * iqr))
 
     outlier_donors = df[is_outlier]["Donor"].unique()
     outlier_str = ", ".join(map(str, outlier_donors))
@@ -532,13 +682,11 @@ def sex_boxplot(df, population_name, tissue):
         f"Outlier donors for {population_name} in tissue {tissue}: {outlier_str}"
     )
 
-    # df_filtered = df[~is_outlier].reset_index(drop=True)
     df_filtered = df
 
-    default_colors = sns.color_palette(n_colors=len(unique_sexes))
-    box_palette = dict(zip(unique_sexes, default_colors))
+    box_palette = _palette_for_categories(unique_sexes, sex_palette)
 
-    fig, ax = plt.subplots(figsize=(8, 8))
+    fig, ax = plt.subplots(figsize=(9, 8))
 
     sns.boxplot(
         x="Sex",
@@ -550,6 +698,12 @@ def sex_boxplot(df, population_name, tissue):
         dodge=False,
         boxprops=dict(alpha=0.4),
         showfliers=True,
+        flierprops={
+            "marker": "o",
+            "markerfacecolor": "white",
+            "markeredgecolor": "black",
+            "markersize": 6,
+        },
         ax=ax,
         zorder=1,
     )
@@ -570,7 +724,7 @@ def sex_boxplot(df, population_name, tissue):
     sns.stripplot(
         x="Sex",
         y=population_name,
-        data=df_filtered,
+        data=df_filtered.loc[~is_outlier],
         hue="Sex",
         order=unique_sexes,
         palette=box_palette,
@@ -601,7 +755,7 @@ def sex_boxplot(df, population_name, tissue):
         annotator.configure(
             test="Mann-Whitney",
             text_format="star",
-            loc="inside",
+            loc="outside",
             comparisons_correction="bonferroni",
             line_width=1.2,
             hide_non_significant=True,
@@ -621,12 +775,35 @@ def sex_boxplot(df, population_name, tissue):
             f"Not enough valid sexes for statistical comparison in {population_name} for tissue {tissue}."
         )
 
-    plt.xticks(rotation=45, ha="right", fontsize=12)
+    sex_positions = {sex: position for position,
+                     sex in enumerate(unique_sexes)}
+    for sex, outliers in df.loc[is_outlier].groupby("Sex", sort=False):
+        outliers = outliers.sort_values(population_name)
+        for index, (_, outlier) in enumerate(outliers.iterrows()):
+            to_right = index % 2 == 0
+            ax.annotate(
+                str(outlier["Donor"]),
+                xy=(sex_positions[sex], outlier[population_name]),
+                xytext=(10 if to_right else -10, 5 * (index // 2)),
+                textcoords="offset points",
+                ha="left" if to_right else "right",
+                va="center",
+                fontsize=8,
+                arrowprops={"arrowstyle": "-", "color": "gray", "lw": 0.7},
+                annotation_clip=False,
+                zorder=5,
+            )
+
+    sex_donor_counts = df_filtered.groupby("Sex")["Donor"].nunique()
+    ax.set_xticks(range(len(unique_sexes)))
+    ax.set_xticklabels(
+        [f"{sex}\n(n={sex_donor_counts.get(sex, 0)})" for sex in unique_sexes],
+        rotation=45, ha="right", fontsize=12)
     plt.yticks(fontsize=10)
-    plt.title(f"{population_name} in {tissue}", fontsize=14)
+    ax.set_title(f"{population_name} in {tissue}", fontsize=14, pad=38)
 
     sns.despine()
-    plt.tight_layout()
+    fig.tight_layout(rect=(0, 0, 0.9, 0.9))
 
     plt.savefig(
         f"{population_name}_{tissue}_boxplot.png", dpi=300, bbox_inches="tight"
@@ -746,6 +923,71 @@ def ols_summary(df):
     plt.show()
 
 
+def plot_group_comparison_summary(group_comparison_stats_df, significant_only=True):
+    """Plot unique sex-by-ethnicity contrasts with confidence intervals."""
+    required = {
+        "Subset", "Tissue", "Reference_Group", "Comparison_Group",
+        "N_Reference", "N_Comparison", "Coefficient", "CI_Lower",
+        "CI_Upper", "p_value_FDR",
+        "Is_Significant_FDR",
+    }
+    missing = required.difference(group_comparison_stats_df.columns)
+    if missing:
+        raise ValueError(
+            f"Group comparison results are missing columns: {sorted(missing)}")
+
+    data = group_comparison_stats_df[
+        group_comparison_stats_df["Reference_Group"]
+        < group_comparison_stats_df["Comparison_Group"]
+    ].copy()
+    if significant_only:
+        data = data[data["Is_Significant_FDR"]]
+    if data.empty:
+        logging.warning("No group-combination contrasts to plot.")
+        return
+
+    data = data.sort_values("Coefficient").reset_index(drop=True)
+    data["Plot_Label"] = data.apply(
+        lambda row: (
+            f"{row['Subset']} ({row['Tissue']}): "
+            f"{row['Reference_Group']} (n={row['N_Reference']}) → "
+            f"{row['Comparison_Group']} (n={row['N_Comparison']}) "
+            f"(q={row['p_value_FDR']:.3g})"
+        ),
+        axis=1,
+    )
+    tissues = data["Tissue"].drop_duplicates().tolist()
+    palette = dict(zip(
+        tissues, sns.color_palette("tab20", n_colors=len(tissues))))
+    figure_height = max(
+        7, 0.55 * data["Subset"].nunique(), 0.38 * len(data))
+    fig, ax = plt.subplots(figsize=(12, figure_height))
+
+    for tissue in tissues:
+        tissue_data = data[data["Tissue"] == tissue]
+        positions = tissue_data.index.to_numpy()
+        coefficients = tissue_data["Coefficient"].to_numpy()
+        lower_errors = coefficients - tissue_data["CI_Lower"].to_numpy()
+        upper_errors = tissue_data["CI_Upper"].to_numpy() - coefficients
+        ax.errorbar(
+            coefficients, positions,
+            xerr=[lower_errors, upper_errors],
+            fmt="o", color=palette[tissue], ecolor=palette[tissue],
+            capsize=3, label=tissue,
+        )
+
+    ax.axvline(0, color="black", linestyle="--", linewidth=1)
+    ax.set_yticks(data.index)
+    ax.set_yticklabels(data["Plot_Label"], fontsize=8)
+    ax.set_xlabel("Adjusted outcome difference (comparison − reference)")
+    ax.set_title("FDR-significant Sex × Ethnicity group comparisons")
+    ax.legend(title="Tissue", bbox_to_anchor=(1.02, 1), loc="upper left")
+    ax.grid(axis="x", alpha=0.25)
+    fig.tight_layout(rect=(0, 0, 0.84, 1))
+    plt.show()
+    return fig
+
+
 def visualize_ols_vs_mann_whitney(
         df, population_name, tissue, target_variable="BMI",
         adjusted_p_value=None):
@@ -790,7 +1032,10 @@ def visualize_ols_vs_mann_whitney(
 
     if "Sex" in target_variable:
         sns.boxplot(x="Sex", y=safe_pop, data=df_tissue,
-                    ax=axes[0], palette=sex_palette, hue="Sex", legend=False)
+                    ax=axes[0],
+                    palette=_palette_for_categories(
+                        df_tissue["Sex"].unique(), sex_palette),
+                    hue="Sex", legend=False)
         sns.stripplot(x="Sex", y=safe_pop, data=df_tissue,
                       ax=axes[0], color="black", alpha=0.6, jitter=True)
         axes[0].set_title(
@@ -802,7 +1047,10 @@ def visualize_ols_vs_mann_whitney(
         ])
     elif "Ethnicity" in target_variable:
         sns.boxplot(x="Ethnicity", y=safe_pop, data=df_tissue,
-                    ax=axes[0], hue="Ethnicity", palette=publication_palette, legend=False)
+                    ax=axes[0], hue="Ethnicity",
+                    palette=_palette_for_categories(
+                        df_tissue["Ethnicity"].unique(), publication_palette),
+                    legend=False)
         sns.stripplot(x="Ethnicity", y=safe_pop, data=df_tissue,
                       ax=axes[0], color="black", alpha=0.6, jitter=True)
         ethnicity_counts = df_tissue.groupby("Ethnicity")["Donor"].nunique()
