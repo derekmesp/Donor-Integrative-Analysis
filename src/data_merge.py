@@ -1,5 +1,4 @@
 import pandas as pd
-import numpy as np
 
 
 def merge_dataframes(data_path, metadata_path):
@@ -17,8 +16,6 @@ def merge_dataframes(data_path, metadata_path):
     df1 = pd.read_excel(data_path)
     df2 = pd.read_excel(metadata_path)
 
-    # Normalize donor identifiers so trailing spaces (including nonbreaking
-    # spaces from Excel) do not prevent metadata matches.
     df1['Donor'] = df1['Donor'].astype('string').str.strip()
     df2['Donor'] = df2['Donor'].astype('string').str.strip()
 
@@ -33,6 +30,9 @@ def merge_dataframes(data_path, metadata_path):
     return merged_df
 
 
-merged_df = merge_dataframes(
-    'Donor Master Sheet.xlsx', 'Donors Information sheet(D0001-D0708).xlsx')
-merged_df.to_excel('merged_data.xlsx', index=False)
+if __name__ == "__main__":
+    merged_df = merge_dataframes(
+        "Donor Master Sheet.xlsx",
+        "Donors Information sheet(D0001-D0708).xlsx",
+    )
+    merged_df.to_excel("merged_data.xlsx", index=False)

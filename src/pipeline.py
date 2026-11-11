@@ -3,7 +3,6 @@ from patsy import build_design_matrices, dmatrices
 import matplotlib.pyplot as plt
 from itertools import combinations
 from scipy import stats
-from matplotlib import pyplot as plt
 import pandas as pd
 import numpy as np
 import logging
@@ -30,7 +29,22 @@ sex_palette = {
 
 
 def _palette_for_categories(categories, base_palette):
-    """Keep known category colors fixed and fill missing categories consistently."""
+    """
+    Create a color palette for a set of categories, using a base palette and adding extra colors for any missing categories.
+
+    Parameters:
+    -----------
+    categories : list
+        A list of category names for which to create a color palette.
+    base_palette : dict
+        A dictionary mapping category names to colors. This serves as the base palette.
+
+    Returns:
+    --------
+    dict
+        A dictionary mapping each category in `categories` to a color. Categories not in the base
+        palette will be assigned colors from a seaborn color palette.
+    """
     extra_categories = sorted(set(categories).difference(base_palette))
     extra_colors = sns.color_palette("husl", n_colors=len(extra_categories))
     palette = dict(base_palette)
@@ -324,13 +338,27 @@ def analyze_tissue_demographics(df, subset_columns, min_samples=20, alpha=0.05):
 
 def analyze_tissue_demographic_group_combinations(
         df, subset_columns, min_samples=20, alpha=0.05):
-    """Compare every observed sex-by-ethnicity group pair within each tissue.
+    """
+    Iterates through cell subsets running tissue-stratified OLS models with robust errors
+    for every combination of sex and ethnicity groups.
 
-    The model treats each Sex × Ethnicity combination as a group and adjusts
-    for Age and BMI. Groups with fewer than two complete observations are
-    excluded. Each reported coefficient is Comparison_Group minus
-    Reference_Group. Both directions are returned for every pair, while BH
-    correction is applied once per unique pair and shared by its two rows.
+    Parameters:
+    -----------
+    df : pd.DataFrame
+        The raw dataset containing demographics and cell markers.
+    subset_columns : list
+        List of strings corresponding to the T-cell subset columns to evaluate.
+    min_samples : int
+        Minimum row count required per tissue to calculate valid statistics.
+    alpha : float
+        P-value threshold to flag significant demographic discoveries.
+
+    Returns:
+    --------
+    pd.DataFrame
+        A long-form summary table tracking every single demographic coefficient, 
+        standard error, p-value, and significance flag across all subsets and tissues.
+
     """
     demographics = ["Age", "BMI", "Sex", "Ethnicity", "Tissue"]
     name_mapping = {col: column_clean(col) for col in subset_columns}
@@ -354,6 +382,13 @@ def analyze_tissue_demographic_group_combinations(
 
         for tissue, tissue_df in clean_df.groupby("Tissue", sort=False):
             tissue_df = tissue_df.copy()
+            ethnicity_counts = tissue_df["Ethnicity"].value_counts()
+            rare_ethnicities = ethnicity_counts[ethnicity_counts < 2].index.tolist(
+            )
+            if rare_ethnicities:
+                tissue_df = tissue_df[
+                    ~tissue_df["Ethnicity"].isin(rare_ethnicities)].copy()
+
             tissue_df["Demographic_Group"] = (
                 tissue_df["Sex"] + " / " + tissue_df["Ethnicity"])
             group_counts = tissue_df["Demographic_Group"].value_counts()
@@ -456,7 +491,7 @@ def analyze_tissue_demographic_group_combinations(
     return results
 
 
-def stat_boxplot(df, population_name, tissue):
+def stat_boxplot(df, population_name, tissue, sex=None):
     """
     Generates a boxplot for a specified population across different ethnicities within a given tissue.
 
@@ -468,6 +503,8 @@ def stat_boxplot(df, population_name, tissue):
         The name of the population column to plot.
     tissue : str
         The tissue type to filter the data by.
+    sex : str, optional
+        If provided, include only donors in this sex group.
 
     Returns:
     --------
@@ -476,9 +513,17 @@ def stat_boxplot(df, population_name, tissue):
 
     df = df.dropna(subset=["Ethnicity", "Tissue", population_name, "Donor"])
     df = df[df["Tissue"] == tissue].reset_index(drop=True)
+    if sex is not None:
+        if "Sex" not in df.columns:
+            raise ValueError("The dataset must contain a 'Sex' column")
+        df = df[df["Sex"] == sex].reset_index(drop=True)
 
     if df.empty:
-        logging.warning(f"No data available for tissue {tissue}")
+        group_description = (
+            f"tissue {tissue} and sex {sex}"
+            if sex is not None else f"tissue {tissue}"
+        )
+        logging.warning(f"No data available for {group_description}")
         return
 
     ethnicity_counts = df["Ethnicity"].value_counts()
@@ -512,137 +557,107 @@ def stat_boxplot(df, population_name, tissue):
         f"Outlier donors for {population_name} in tissue {tissue}: {outlier_str}"
     )
 
-    df_filtered = df
-
-    box_palette = _palette_for_categories(
-        unique_ethnicities, publication_palette)
-
-    fig, ax = plt.subplots(figsize=(10, 8))
-
-    sns.boxplot(
-        x="Ethnicity",
-        y=population_name,
-        data=df_filtered,
-        hue="Ethnicity",
-        order=unique_ethnicities,
-        palette=box_palette,
-        dodge=False,
-        boxprops=dict(alpha=0.4),
-        showfliers=True,
-        flierprops={
-            "marker": "o",
-            "markerfacecolor": "white",
-            "markeredgecolor": "black",
-            "markersize": 6,
-        },
-        ax=ax,
-        zorder=1,
-    )
-
-    sns.lineplot(
-        x="Ethnicity",
-        y=population_name,
-        data=df_filtered,
-        units="Donor",
-        estimator=None,
-        color="black",
-        alpha=0.3,
-        linewidth=1,
-        ax=ax,
-        zorder=2,
-    )
-
-    sns.stripplot(
-        x="Ethnicity",
-        y=population_name,
-        data=df_filtered.loc[~is_outlier],
-        hue="Ethnicity",
-        order=unique_ethnicities,
-        palette=box_palette,
-        legend=False,
-        jitter=True,
-        size=6,
-        edgecolor="black",
-        linewidth=0.5,
-        ax=ax,
-        zorder=3,
-    )
-
-    if len(unique_ethnicities) >= 2:
-        pairs = list(combinations(unique_ethnicities, 2))
-        annotator = Annotator(
-            ax,
-            pairs,
-            data=df,
-            x="Ethnicity",
-            y=population_name,
-            order=unique_ethnicities,
-        )
-        annotator.configure(
-            test="Mann-Whitney",
-            text_format="star",
-            loc="outside",
-            comparisons_correction="bonferroni",
-            line_width=1.2,
-            hide_non_significant=True,
-            verbose=False,
-            line_offset=0.05,
-            line_height=0.02,
-            text_offset=2.0,
-        )
-        try:
-            annotator.apply_and_annotate()
-        except Exception as e:
+    def draw_boxplot(plot_df, categories):
+        if plot_df.empty:
             logging.warning(
-                f"Could not apply statistical annotations for {population_name} in tissue {tissue}: {str(e)}"
-            )
-    else:
-        logging.warning(
-            f"Not enough valid ethnicities for statistical comparison in {population_name} for tissue {tissue}."
+                "No observations remain to plot for %s in tissue %s",
+                population_name, tissue)
+            return
+
+        box_palette = _palette_for_categories(categories, publication_palette)
+        fig, ax = plt.subplots(figsize=(10, 8))
+        sns.boxplot(
+            x="Ethnicity", y=population_name, data=plot_df, hue="Ethnicity",
+            order=categories, palette=box_palette, dodge=False,
+            boxprops=dict(alpha=0.4), showfliers=True,
+            flierprops={
+                "marker": "o", "markerfacecolor": "white",
+                "markeredgecolor": "black", "markersize": 6,
+            },
+            ax=ax, zorder=1,
+        )
+        sns.lineplot(
+            x="Ethnicity", y=population_name, data=plot_df, units="Donor",
+            estimator=None, color="black", alpha=0.3, linewidth=1,
+            ax=ax, zorder=2,
+        )
+        point_data = plot_df.loc[~is_outlier.loc[plot_df.index]]
+        sns.stripplot(
+            x="Ethnicity", y=population_name, data=point_data, hue="Ethnicity",
+            order=categories, palette=box_palette, legend=False, jitter=True,
+            size=6, edgecolor="black", linewidth=0.5, ax=ax, zorder=3,
         )
 
-    ethnicity_positions = {
-        ethnicity: position
-        for position, ethnicity in enumerate(unique_ethnicities)
-    }
-    for ethnicity, outliers in df.loc[is_outlier].groupby("Ethnicity", sort=False):
-        outliers = outliers.sort_values(population_name)
-        for index, (_, outlier) in enumerate(outliers.iterrows()):
-            to_right = index % 2 == 0
-            ax.annotate(
-                str(outlier["Donor"]),
-                xy=(ethnicity_positions[ethnicity], outlier[population_name]),
-                xytext=(10 if to_right else -10, 5 * (index // 2)),
-                textcoords="offset points",
-                ha="left" if to_right else "right",
-                va="center",
-                fontsize=8,
-                arrowprops={"arrowstyle": "-", "color": "gray", "lw": 0.7},
-                annotation_clip=False,
-                zorder=5,
+        if len(categories) >= 2:
+            pairs = list(combinations(categories, 2))
+            annotator = Annotator(
+                ax, pairs, data=plot_df, x="Ethnicity", y=population_name,
+                order=categories,
             )
+            annotator.configure(
+                test="Mann-Whitney", text_format="star", loc="outside",
+                comparisons_correction="bonferroni", line_width=1.2,
+                hide_non_significant=True, verbose=False, line_offset=0.05,
+                line_height=0.02, text_offset=2.0,
+            )
+            try:
+                annotator.apply_and_annotate()
+            except Exception as e:
+                logging.warning(
+                    "Could not apply statistical annotations for %s in tissue %s: %s",
+                    population_name, tissue, e)
 
-    ethnicity_donor_counts = df_filtered.groupby("Ethnicity")[
-        "Donor"].nunique()
-    ax.set_xticks(range(len(unique_ethnicities)))
-    ax.set_xticklabels(
-        [f"{ethnicity}\n(n={ethnicity_donor_counts.get(ethnicity, 0)})"
-         for ethnicity in unique_ethnicities],
-        rotation=45, ha="right", fontsize=12)
-    plt.yticks(fontsize=10)
-    ax.set_title(f"{population_name} in {tissue}", fontsize=14, pad=38)
+        positions = {ethnicity: i for i,
+                     ethnicity in enumerate(categories)}
+        for ethnicity, outliers in df.loc[is_outlier].groupby(
+                "Ethnicity", sort=False):
+            if ethnicity not in positions:
+                continue
+            for index, (_, outlier) in enumerate(
+                    outliers.sort_values(population_name).iterrows()):
+                to_right = index % 2 == 0
+                ax.annotate(
+                    str(outlier["Donor"]),
+                    xy=(positions[ethnicity], outlier[population_name]),
+                    xytext=(10 if to_right else -10, 5 * (index // 2)),
+                    textcoords="offset points",
+                    ha="left" if to_right else "right", va="center",
+                    fontsize=8,
+                    arrowprops={"arrowstyle": "-",
+                                "color": "gray", "lw": 0.7},
+                    annotation_clip=False, zorder=5,
+                )
 
-    sns.despine()
-    fig.tight_layout(rect=(0, 0, 0.82, 0.9))
+        donor_counts = plot_df.groupby("Ethnicity")["Donor"].nunique()
+        ax.set_xticks(range(len(categories)))
+        ax.set_xticklabels(
+            [f"{ethnicity}\n(n={donor_counts.get(ethnicity, 0)})"
+             for ethnicity in categories],
+            rotation=45, ha="right", fontsize=12)
+        ax.tick_params(axis="y", labelsize=10)
+        title_pad = 55
+        layout_top = 0.82
+        title = f"{population_name} in {tissue}"
+        if sex is not None:
+            title += f" - {sex}"
+        ax.set_title(
+            title, fontsize=14, pad=title_pad)
+        sns.despine()
+        fig.tight_layout(rect=(0, 0, 0.94, layout_top))
+        filename = f"{population_name}_{tissue}_boxplot_with_outliers"
+        if sex is not None:
+            safe_sex = re.sub(r"[^A-Za-z0-9_-]+", "_", str(sex)).strip("_")
+            filename += f"_{safe_sex}"
+        plt.savefig(
+            f"{filename}.png",
+            dpi=300, bbox_inches="tight")
+        plt.show()
+        plt.close(fig)
 
-    plt.savefig(
-        f"{population_name}_{tissue}_boxplot.png", dpi=300, bbox_inches="tight"
-    )
-    plt.show()
-    plt.close(fig)
+    draw_boxplot(df, unique_ethnicities)
 
 
-def sex_boxplot(df, population_name, tissue):
+def sex_boxplot(df, population_name, tissue, ethnicity=None):
     """
     Generates a boxplot for a specified population across different sexes within a given tissue.
 
@@ -654,6 +669,8 @@ def sex_boxplot(df, population_name, tissue):
         The name of the population column to plot.
     tissue : str
         The tissue type to filter the data by.
+    ethnicity : str, optional
+        If provided, include only donors with this ethnicity.
 
     Returns:
     --------
@@ -662,9 +679,17 @@ def sex_boxplot(df, population_name, tissue):
 
     df = df.dropna(subset=["Sex", "Tissue", population_name, "Donor"])
     df = df[df["Tissue"] == tissue].reset_index(drop=True)
+    if ethnicity is not None:
+        if "Ethnicity" not in df.columns:
+            raise ValueError("The dataset must contain an 'Ethnicity' column")
+        df = df[df["Ethnicity"] == ethnicity].reset_index(drop=True)
 
     if df.empty:
-        logging.warning(f"No data available for tissue {tissue}")
+        group_description = (
+            f"tissue {tissue} and ethnicity {ethnicity}"
+            if ethnicity is not None else f"tissue {tissue}"
+        )
+        logging.warning(f"No data available for {group_description}")
         return
 
     unique_sexes = list(df["Sex"].unique())
@@ -800,14 +825,142 @@ def sex_boxplot(df, population_name, tissue):
         [f"{sex}\n(n={sex_donor_counts.get(sex, 0)})" for sex in unique_sexes],
         rotation=45, ha="right", fontsize=12)
     plt.yticks(fontsize=10)
-    ax.set_title(f"{population_name} in {tissue}", fontsize=14, pad=38)
+    title = f"{population_name} in {tissue}"
+    if ethnicity is not None:
+        title += f" ({ethnicity})"
+    ax.set_title(title, fontsize=14, pad=55)
 
     sns.despine()
-    fig.tight_layout(rect=(0, 0, 0.9, 0.9))
+    fig.tight_layout(rect=(0, 0, 0.9, 0.82))
 
-    plt.savefig(
-        f"{population_name}_{tissue}_boxplot.png", dpi=300, bbox_inches="tight"
+    filename = f"{population_name}_{tissue}_boxplot"
+    if ethnicity is not None:
+        safe_ethnicity = re.sub(r"[^A-Za-z0-9_-]+", "_", ethnicity).strip("_")
+        filename += f"_{safe_ethnicity}"
+    plt.savefig(f"{filename}.png", dpi=300, bbox_inches="tight")
+    plt.show()
+    plt.close(fig)
+
+
+def sex_ethnicity_boxplot(df, population_name, tissue, groups):
+    """Compare selected (sex, ethnicity) groups within one tissue.
+
+    ``groups`` is an ordered sequence of pairs, for example
+    ``[("FEMALE", "White"), ("MALE", "White")]``.
+    Mann–Whitney annotations are only computed for groups with at least three
+    donors; all selected groups with data remain visible in the plot.
+    """
+    if not groups:
+        raise ValueError("Provide at least one (sex, ethnicity) group")
+
+    selected_groups = [(str(sex).strip(), str(ethnicity).strip())
+                       for sex, ethnicity in groups]
+    group_labels = [f"{sex} / {ethnicity}"
+                    for sex, ethnicity in selected_groups]
+    if len(set(selected_groups)) != len(selected_groups):
+        raise ValueError("Selected sex/ethnicity groups must be unique")
+
+    required = ["Sex", "Ethnicity", "Tissue", "Donor", population_name]
+    missing = [column for column in required if column not in df.columns]
+    if missing:
+        raise ValueError(f"Dataset is missing required columns: {missing}")
+
+    plot_df = df.dropna(subset=required).copy()
+    plot_df = plot_df[plot_df["Tissue"] == tissue]
+    plot_df["_Sex_Ethnicity_Group"] = (
+        plot_df["Sex"].astype("string").str.strip() + " / "
+        + plot_df["Ethnicity"].astype("string").str.strip()
     )
+    plot_df = plot_df[
+        plot_df["_Sex_Ethnicity_Group"].isin(group_labels)
+    ].copy()
+    present_groups = [label for label in group_labels
+                      if label in plot_df["_Sex_Ethnicity_Group"].values]
+    if plot_df.empty:
+        logging.warning(
+            "No data for selected sex/ethnicity groups in tissue %s", tissue)
+        return
+
+    group_counts = plot_df.groupby("_Sex_Ethnicity_Group")["Donor"].nunique()
+    q1 = plot_df.groupby("_Sex_Ethnicity_Group")[population_name].transform(
+        lambda values: values.quantile(0.25))
+    q3 = plot_df.groupby("_Sex_Ethnicity_Group")[population_name].transform(
+        lambda values: values.quantile(0.75))
+    iqr = q3 - q1
+    is_outlier = ((plot_df[population_name] < q1 - 1.5 * iqr)
+                  | (plot_df[population_name] > q3 + 1.5 * iqr))
+
+    palette = _palette_for_categories(present_groups, {})
+    fig, ax = plt.subplots(figsize=(max(9, 1.6 * len(present_groups)), 8))
+    sns.boxplot(
+        data=plot_df, x="_Sex_Ethnicity_Group", y=population_name,
+        hue="_Sex_Ethnicity_Group", order=present_groups,
+        palette=palette, dodge=False, legend=False, showfliers=True,
+        boxprops={"alpha": 0.4},
+        flierprops={"marker": "o", "markerfacecolor": "white",
+                    "markeredgecolor": "black", "markersize": 6},
+        ax=ax, zorder=1,
+    )
+    sns.stripplot(
+        data=plot_df.loc[~is_outlier], x="_Sex_Ethnicity_Group",
+        y=population_name, hue="_Sex_Ethnicity_Group", order=present_groups,
+        palette=palette, legend=False, jitter=True, size=6,
+        edgecolor="black", linewidth=0.5, ax=ax, zorder=3,
+    )
+
+    testable_groups = [group for group in present_groups
+                       if group_counts.get(group, 0) >= 3]
+    if len(testable_groups) >= 2:
+        annotator = Annotator(
+            ax, list(combinations(testable_groups, 2)), data=plot_df,
+            x="_Sex_Ethnicity_Group", y=population_name,
+            order=present_groups,
+        )
+        annotator.configure(
+            test="Mann-Whitney", text_format="star", loc="outside",
+            comparisons_correction="bonferroni", hide_non_significant=True,
+            verbose=False, line_offset=0.05, line_height=0.02,
+            text_offset=2.0,
+        )
+        try:
+            annotator.apply_and_annotate()
+        except Exception as exc:
+            logging.warning(
+                "Could not annotate selected group comparisons for %s in %s: %s",
+                population_name, tissue, exc)
+
+    positions = {group: index for index, group in enumerate(present_groups)}
+    for group, outliers in plot_df.loc[is_outlier].groupby(
+            "_Sex_Ethnicity_Group", sort=False):
+        for index, (_, outlier) in enumerate(
+                outliers.sort_values(population_name).iterrows()):
+            side = 1 if index % 2 == 0 else -1
+            ax.annotate(
+                str(outlier["Donor"]),
+                xy=(positions[group], outlier[population_name]),
+                xytext=(10 * side, 5 * (index // 2)),
+                textcoords="offset points", ha="left" if side > 0 else "right",
+                va="center", fontsize=8,
+                arrowprops={"arrowstyle": "-", "color": "gray", "lw": 0.7},
+                annotation_clip=False, zorder=5,
+            )
+
+    ax.set_xticks(range(len(present_groups)))
+    ax.set_xticklabels(
+        [f"{group}\n(n={group_counts.get(group, 0)})"
+         for group in present_groups], rotation=35, ha="right")
+    ax.set_title(f"{population_name} in {tissue}: selected sex/ethnicity groups",
+                 fontsize=14, pad=55)
+    ax.set_xlabel("Sex / ethnicity")
+    ax.set_ylabel(population_name)
+    sns.despine()
+    fig.tight_layout(rect=(0, 0, 1, 0.82))
+    filename_parts = [population_name, tissue, *present_groups]
+    filename = "_vs_".join(
+        re.sub(r"[^A-Za-z0-9_-]+", "_", str(part)).strip("_")
+        for part in filename_parts
+    )
+    plt.savefig(f"{filename}_boxplot.png", dpi=300, bbox_inches="tight")
     plt.show()
     plt.close(fig)
 
@@ -924,7 +1077,23 @@ def ols_summary(df):
 
 
 def plot_group_comparison_summary(group_comparison_stats_df, significant_only=True):
-    """Plot unique sex-by-ethnicity contrasts with confidence intervals."""
+    """
+    Generates a summary plot of group comparison results, showing the adjusted outcome differences
+    between reference and comparison groups for each subset and tissue.
+
+    Parameters:
+    -----------
+    group_comparison_stats_df : pd.DataFrame
+        The DataFrame containing group comparison statistics.
+    significant_only : bool, optional
+        If True, only significant comparisons (based on FDR) will be plotted. Default is
+        True.
+
+    Returns:
+    --------
+    None
+
+    """
     required = {
         "Subset", "Tissue", "Reference_Group", "Comparison_Group",
         "N_Reference", "N_Comparison", "Coefficient", "CI_Lower",
@@ -940,6 +1109,9 @@ def plot_group_comparison_summary(group_comparison_stats_df, significant_only=Tr
         group_comparison_stats_df["Reference_Group"]
         < group_comparison_stats_df["Comparison_Group"]
     ].copy()
+    data = data[
+        (data["N_Reference"] > 2) & (data["N_Comparison"] > 2)
+    ]
     if significant_only:
         data = data[data["Is_Significant_FDR"]]
     if data.empty:
@@ -985,7 +1157,7 @@ def plot_group_comparison_summary(group_comparison_stats_df, significant_only=Tr
     ax.grid(axis="x", alpha=0.25)
     fig.tight_layout(rect=(0, 0, 0.84, 1))
     plt.show()
-    return fig
+    return None
 
 
 def visualize_ols_vs_mann_whitney(
