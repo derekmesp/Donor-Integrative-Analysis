@@ -55,7 +55,27 @@ def _palette_for_categories(categories, base_palette):
 
 def _prepare_ethnicity_boxplot_data(
         df, population_name, tissue, sex=None, min_donors=3):
-    """Prepare the shared donor-filtered data used by ethnicity boxplots."""
+    """
+    Prepare data for ethnicity boxplots by filtering and cleaning the DataFrame.
+
+    Parameters:
+    -----------
+    df : pandas.DataFrame
+        The input DataFrame containing the data.
+    population_name : str
+        The name of the column containing the population data.
+    tissue : str
+        The name of the tissue to filter by.
+    sex : str, optional
+        The sex to filter by, if applicable.
+    min_donors : int, default=3
+        The minimum number of donors required for each ethnicity group.
+
+    Returns:
+    --------
+    tuple
+        A tuple containing the filtered DataFrame, the list of categories, and the donor counts.
+    """
     required = ["Ethnicity", "Tissue", population_name, "Donor"]
     if sex is not None:
         required.append("Sex")
@@ -94,7 +114,22 @@ def _prepare_ethnicity_boxplot_data(
 
 
 def _ethnicity_iqr_outliers(data, population_name):
-    """Return an outlier mask calculated within each ethnicity group."""
+    """
+    Identify outliers in the population data based on the interquartile range (IQR) for each ethnicity group.
+
+    Parameters:
+    -----------
+    data : pandas.DataFrame
+        The DataFrame containing the data to be analyzed.
+    population_name : str
+        The name of the column containing the population data.
+
+    Returns:
+    --------
+    pandas.Series
+        A boolean Series indicating whether each row in the DataFrame is an outlier (True) or not (False).
+    """
+
     grouped = data.groupby("Ethnicity")[population_name]
     q1 = grouped.transform(lambda values: values.quantile(0.25))
     q3 = grouped.transform(lambda values: values.quantile(0.75))
@@ -104,7 +139,26 @@ def _ethnicity_iqr_outliers(data, population_name):
 
 
 def _annotate_ethnicity_comparisons(ax, data, population_name, categories):
-    """Apply the shared Bonferroni-corrected Mann–Whitney annotations."""
+    """
+    Annotate pairwise comparisons between ethnicity groups on a boxplot.
+
+    Parameters:
+    -----------
+    ax : matplotlib.axes.Axes
+        The axes object on which to annotate.
+    data : pandas.DataFrame
+        The DataFrame containing the data to be annotated.
+    population_name : str
+        The name of the column containing the population data.
+    categories : list
+        The list of ethnicity categories to compare.
+
+    Returns:
+    --------
+    None
+        The function modifies the axes object in place and does not return a value.
+
+    """
     if len(categories) < 2:
         return
     annotator = Annotator(
@@ -194,7 +248,9 @@ def summarize_categorical_data(df, columns=None, include_missing=True):
         for category, count in counts.items():
             rows.append({
                 "Variable": demographic if demographic in {"Sex", "Ethnicity"} else column,
-                "Category": "(Missing)" if pd.isna(category) else category,
+                "Category": "(Missing)" if bool(
+                    pd.isna(np.asarray([category], dtype=object))[0]
+                ) else category,
                 "Count": int(count),
                 "Percent": (100 * count / denominator) if denominator else 0.0,
             })
@@ -555,10 +611,17 @@ def analyze_tissue_demographic_group_combinations(
         unique_pairs = results.drop_duplicates("_pair_key")
         valid_pairs = unique_pairs[unique_pairs["p_value"].notna()]
         if not valid_pairs.empty:
-            corrected_pvalues = multipletests(
-                valid_pairs["p_value"], alpha=alpha, method="fdr_bh")[1]
-            fdr_lookup = dict(zip(valid_pairs["_pair_key"], corrected_pvalues))
-            results["p_value_FDR"] = results["_pair_key"].map(fdr_lookup)
+            correction_result = multipletests(
+                valid_pairs["p_value"], alpha=alpha, method="fdr_bh")
+            corrected_pvalues = (
+                correction_result[1] if correction_result is not None else None
+            )
+            if corrected_pvalues is not None:
+                fdr_lookup = {}
+                pair_keys = valid_pairs["_pair_key"].tolist()
+                for index, pair_key in enumerate(pair_keys):
+                    fdr_lookup[pair_key] = corrected_pvalues[index]
+                results["p_value_FDR"] = results["_pair_key"].map(fdr_lookup)
         results["Is_Significant_FDR"] = results["p_value_FDR"] < alpha
         results = results.drop(columns="_pair_key")
     return results
@@ -586,7 +649,8 @@ def analyze_paired_tissue_demographics(
                 *subset_columns}
     missing = required.difference(df.columns)
     if missing:
-        raise ValueError(f"Dataset is missing required columns: {sorted(missing)}")
+        raise ValueError(
+            f"Dataset is missing required columns: {sorted(missing)}")
     if not tissue_class_map:
         raise ValueError("Provide an explicit tissue_class_map")
 
@@ -770,7 +834,8 @@ def plot_paired_tissue_demographic_summary(
     ax.set_yticklabels(labels, fontsize=8)
     ax.set_xlabel(
         f"Change in {first['Class_A']} − {first['Class_B']} difference")
-    ax.set_title("Demographic associations with paired tissue-class differences")
+    ax.set_title(
+        "Demographic associations with paired tissue-class differences")
     ax.grid(axis="x", alpha=0.25)
     legend_handles = [
         Line2D([0], [0], marker="o", color="none", markerfacecolor="#b23a48",
@@ -869,7 +934,8 @@ def plot_paired_tissue_class_summary(results, significant_only=False):
     }
     missing = required.difference(results.columns)
     if missing:
-        raise ValueError(f"Paired tissue results are missing columns: {sorted(missing)}")
+        raise ValueError(
+            f"Paired tissue results are missing columns: {sorted(missing)}")
     data = results.dropna(
         subset=["Mean_Difference", "CI_Lower", "CI_Upper"]).copy()
     if significant_only:
