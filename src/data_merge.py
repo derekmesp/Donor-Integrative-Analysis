@@ -20,7 +20,10 @@ def merge_dataframes(data_path, metadata_path):
     df2['Donor'] = df2['Donor'].astype('string').str.strip()
 
     merged_df = pd.merge(
-        df1, df2[['Donor', 'Ethnicity:', 'Age (yr):', 'BMI (kg/m^2):', 'Sex:']], on='Donor', how='left')
+        df1, df2[[
+            'Donor', 'Ethnicity:', 'Age (yr):', 'BMI (kg/m^2):', 'Sex:',
+            'Ab CMV:', 'Ab EBV (IgG):',
+        ]], on='Donor', how='left')
 
     merged_df['Age (yr):'] = pd.to_numeric(
         merged_df['Age (yr):'], errors='coerce')

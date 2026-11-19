@@ -1,0 +1,10 @@
+jupyterlab
+matplotlib
+numpy
+openpyxl
+pandas
+patsy
+scipy
+seaborn
+statannotations
+statsmodels
