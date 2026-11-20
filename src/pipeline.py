@@ -1121,6 +1121,7 @@ def _analyze_group_tissue_interaction(
                             sort=False)[population_name].mean()
     model_data = values.merge(metadata, on="Donor", how="inner").dropna(
         subset=["Sex", "Ethnicity", "Age", "BMI", *antibody_columns])
+    means_source = model_data.copy()
     model_data = model_data[model_data[group_column].isin(
         [reference_group, focal_group])].copy()
 
@@ -1134,6 +1135,20 @@ def _analyze_group_tissue_interaction(
             tissue, 0) >= min_donors_per_group
     ]
     model_data = model_data[model_data["Tissue"].isin(eligible_tissues)].copy()
+    means_source = means_source[
+        means_source["Tissue"].isin(eligible_tissues)].copy()
+    if group_column == "Ethnicity":
+        all_group_counts = means_source.groupby(["Tissue", group_column])[
+            "Donor"].nunique().unstack(fill_value=0)
+        plotted_groups = [
+            group for group in all_group_counts.columns
+            if any(all_group_counts.loc[tissue].get(group, 0)
+                   >= min_donors_per_group for tissue in eligible_tissues)
+        ]
+        if reference_group not in plotted_groups or focal_group not in plotted_groups:
+            plotted_groups = [reference_group, focal_group]
+    else:
+        plotted_groups = [reference_group, focal_group]
     counts_by_tissue = model_data.groupby(["Tissue", group_column])[
         "Donor"].nunique().unstack(fill_value=0)
     status = {
@@ -1215,6 +1230,68 @@ def _analyze_group_tissue_interaction(
     fixed_covariance = model.cov_params().loc[
         fixed_terms, fixed_terms].to_numpy(dtype=float)
     design_info = model.model.data.design_info
+    critical = stats.norm.ppf(1 - alpha / 2)
+    all_adjusted_means = None
+    if group_column == "Ethnicity":
+        means_counts = means_source.groupby(group_column)["Donor"].nunique()
+        mean_model_groups = means_counts[
+            means_counts >= min_donors_per_group].index.tolist()
+        if reference_group in mean_model_groups:
+            means_model_data = means_source[
+                means_source[group_column].isin(mean_model_groups)].copy()
+            means_model_data = means_model_data.rename(
+                columns={population_name: "Outcome"})
+            means_formula = (
+                f"Outcome ~ C({group_column}, Treatment(reference={reference_group!r})) + "
+                f"C(Tissue, Treatment(reference={reference_tissue!r})) + "
+                f"C({adjustment_group}, "
+                f"Treatment(reference={adjustment_reference!r})) + Age + BMI"
+            )
+            if antibody_terms:
+                means_formula += " + " + " + ".join(antibody_terms)
+            try:
+                means_model = smf.mixedlm(
+                    means_formula, data=means_model_data,
+                    groups=means_model_data["Donor"]
+                ).fit(reml=False, method="lbfgs", disp=False)
+                if means_model.converged:
+                    means_fixed = list(means_model.fe_params.index)
+                    means_covariance = means_model.cov_params().loc[
+                        means_fixed, means_fixed].to_numpy(dtype=float)
+                    means_design_info = means_model.model.data.design_info
+                    all_adjusted_means = {}
+                    for tissue in tissues:
+                        standardized = means_model_data[
+                            means_model_data["Tissue"] == tissue]
+                        all_adjusted_means[tissue] = {}
+                        tissue_group_counts = standardized.groupby(
+                            group_column)["Donor"].nunique()
+                        for level in plotted_groups:
+                            if tissue_group_counts.get(level, 0) < min_donors_per_group:
+                                all_adjusted_means[tissue][level] = {
+                                    "mean": np.nan, "lower": np.nan,
+                                    "upper": np.nan,
+                                }
+                                continue
+                            prediction_data = standardized.copy()
+                            prediction_data[group_column] = level
+                            mean_design = build_design_matrices(
+                                [means_design_info], prediction_data,
+                                return_type="dataframe")[0][means_fixed]
+                            average_design = mean_design.mean(axis=0).to_numpy(
+                                dtype=float)
+                            mean_value = float(
+                                average_design @ means_model.fe_params.to_numpy())
+                            mean_variance = float(
+                                average_design @ means_covariance @ average_design)
+                            mean_se = np.sqrt(max(mean_variance, 0.0))
+                            all_adjusted_means[tissue][level] = {
+                                "mean": mean_value,
+                                "lower": mean_value - critical * mean_se,
+                                "upper": mean_value + critical * mean_se,
+                            }
+            except Exception as exc:
+                status["Means_Model_Reason"] = str(exc)
     contrast_rows = []
     covariate_values = {
         adjustment_group: adjustment_reference,
@@ -1241,25 +1318,28 @@ def _analyze_group_tissue_interaction(
         p_value = float(2 * stats.norm.sf(abs(z_score)))
         critical = stats.norm.ppf(1 - alpha / 2)
         tissue_counts = counts_by_tissue.loc[tissue]
-        adjusted_group_means = {}
-        tissue_standardization_data = model_data[
-            model_data["Tissue"] == tissue].copy()
-        for level in [reference_group, focal_group]:
-            prediction_data = tissue_standardization_data.copy()
-            prediction_data[group_column] = level
-            group_design = build_design_matrices(
-                [design_info], prediction_data, return_type="dataframe")[0]
-            average_design = group_design[fixed_terms].mean(axis=0).to_numpy(
-                dtype=float)
-            group_mean = float(average_design @ model.fe_params.to_numpy())
-            group_variance = float(
-                average_design @ fixed_covariance @ average_design)
-            group_se = np.sqrt(max(group_variance, 0.0))
-            adjusted_group_means[level] = {
-                "mean": group_mean,
-                "lower": group_mean - critical * group_se,
-                "upper": group_mean + critical * group_se,
-            }
+        if all_adjusted_means is not None:
+            group_adjusted_means = all_adjusted_means[tissue]
+        else:
+            group_adjusted_means = {}
+            tissue_standardization_data = model_data[
+                model_data["Tissue"] == tissue].copy()
+            for level in [reference_group, focal_group]:
+                prediction_data = tissue_standardization_data.copy()
+                prediction_data[group_column] = level
+                group_design = build_design_matrices(
+                    [design_info], prediction_data, return_type="dataframe")[0]
+                average_design = group_design[fixed_terms].mean(axis=0).to_numpy(
+                    dtype=float)
+                group_mean = float(average_design @ model.fe_params.to_numpy())
+                group_variance = float(
+                    average_design @ fixed_covariance @ average_design)
+                group_se = np.sqrt(max(group_variance, 0.0))
+                group_adjusted_means[level] = {
+                    "mean": group_mean,
+                    "lower": group_mean - critical * group_se,
+                    "upper": group_mean + critical * group_se,
+                }
         contrast_rows.append({
             "Subset": population_name,
             "Group_Column": group_column,
@@ -1272,17 +1352,18 @@ def _analyze_group_tissue_interaction(
             "p_value": p_value,
             "N_Reference": int(tissue_counts.get(reference_group, 0)),
             "N_Focal": int(tissue_counts.get(focal_group, 0)),
-            "Adjusted_Reference_Mean": adjusted_group_means[
+            "Adjusted_Group_Means": group_adjusted_means,
+            "Adjusted_Reference_Mean": group_adjusted_means[
                 reference_group]["mean"],
-            "Reference_Mean_CI_Lower": adjusted_group_means[
+            "Reference_Mean_CI_Lower": group_adjusted_means[
                 reference_group]["lower"],
-            "Reference_Mean_CI_Upper": adjusted_group_means[
+            "Reference_Mean_CI_Upper": group_adjusted_means[
                 reference_group]["upper"],
-            "Adjusted_Focal_Mean": adjusted_group_means[
+            "Adjusted_Focal_Mean": group_adjusted_means[
                 focal_group]["mean"],
-            "Focal_Mean_CI_Lower": adjusted_group_means[
+            "Focal_Mean_CI_Lower": group_adjusted_means[
                 focal_group]["lower"],
-            "Focal_Mean_CI_Upper": adjusted_group_means[
+            "Focal_Mean_CI_Upper": group_adjusted_means[
                 focal_group]["upper"],
         })
     contrasts = pd.DataFrame(contrast_rows)
@@ -1348,6 +1429,12 @@ def _plot_group_tissue_adjusted_means(contrasts, status=None):
     ax : matplotlib.axes._subplots.AxesSubplot
         The axes object containing the plot.
     """
+    if contrasts.empty:
+        reason = (status or {}).get("Reason", "no contrast rows were returned")
+        logging.warning(
+            "No adjusted group-by-tissue means are available to plot: %s",
+            reason)
+        return None
     required = {
         "Subset", "Group_Column", "Tissue", "Contrast", "Adjusted_Reference_Mean",
         "Reference_Mean_CI_Lower", "Reference_Mean_CI_Upper",
@@ -1358,33 +1445,46 @@ def _plot_group_tissue_adjusted_means(contrasts, status=None):
     if missing:
         raise ValueError(
             f"Interaction contrasts are missing columns: {missing}")
-    if contrasts.empty:
-        logging.warning(
-            "No adjusted ethnicity-by-tissue means are available to plot")
-        return
-
     data = contrasts.sort_values("Tissue").reset_index(drop=True)
     positions = np.arange(len(data), dtype=float)
     offset = 0.08
     focal_group, reference_group = data.iloc[0]["Contrast"].split(" - ", 1)
     group_column = data.iloc[0]["Group_Column"]
     palette = sex_palette if group_column == "Sex" else publication_palette
-    group_specs = [
-        ("Adjusted_Reference_Mean", "Reference_Mean_CI_Lower",
-         "Reference_Mean_CI_Upper", reference_group,
-         palette.get(reference_group, "#bd6319")),
-        ("Adjusted_Focal_Mean", "Focal_Mean_CI_Lower",
-         "Focal_Mean_CI_Upper", focal_group,
-         palette.get(focal_group, "#1762a4")),
-    ]
-    fig, ax = plt.subplots(figsize=(max(11, 0.72 * len(data)), 6.5))
-    for direction, (mean_col, lower_col, upper_col, group_name, color) in enumerate(group_specs):
-        x = positions + (direction - 0.5) * 2 * offset
-        means = data[mean_col].to_numpy(dtype=float)
-        lower = means - data[lower_col].to_numpy(dtype=float)
-        upper = data[upper_col].to_numpy(dtype=float) - means
+    fig, ax = plt.subplots(figsize=(max(13, 0.72 * len(data) + 3), 6.5))
+    adjusted_groups = data.iloc[0].get("Adjusted_Group_Means")
+    if isinstance(adjusted_groups, dict):
+        groups_to_plot = list(adjusted_groups)
+        offsets = np.linspace(-offset * (len(groups_to_plot) - 1),
+                              offset * (len(groups_to_plot) - 1),
+                              len(groups_to_plot))
+    else:
+        groups_to_plot = [reference_group, focal_group]
+        offsets = [-offset, offset]
+    for direction, (group_name, group_offset) in enumerate(
+            zip(groups_to_plot, offsets)):
+        if isinstance(adjusted_groups, dict):
+            means = np.array([entry[group_name]["mean"]
+                              for entry in data["Adjusted_Group_Means"]])
+            lower_ci = np.array([entry[group_name]["lower"]
+                                 for entry in data["Adjusted_Group_Means"]])
+            upper_ci = np.array([entry[group_name]["upper"]
+                                 for entry in data["Adjusted_Group_Means"]])
+            lower = means - lower_ci
+            upper = upper_ci - means
+        else:
+            mean_col, lower_col, upper_col = (
+                ("Adjusted_Reference_Mean", "Reference_Mean_CI_Lower",
+                 "Reference_Mean_CI_Upper") if group_name == reference_group else
+                ("Adjusted_Focal_Mean", "Focal_Mean_CI_Lower",
+                 "Focal_Mean_CI_Upper"))
+            means = data[mean_col].to_numpy(dtype=float)
+            lower = means - data[lower_col].to_numpy(dtype=float)
+            upper = data[upper_col].to_numpy(dtype=float) - means
+        color = palette.get(group_name, "#777777")
         ax.errorbar(
-            x, means, yerr=[np.maximum(lower, 0), np.maximum(upper, 0)],
+            positions + group_offset, means,
+            yerr=[np.maximum(lower, 0), np.maximum(upper, 0)],
             fmt="o-", color=color, ecolor=color, capsize=3,
             linewidth=1.5, markersize=5, label=group_name)
 
@@ -1408,16 +1508,19 @@ def _plot_group_tissue_adjusted_means(contrasts, status=None):
             f"{status['Interaction_P']:.3g}")
     ax.set_title(
         f"{data.iloc[0]['Subset']}: adjusted means by tissue and {group_column.lower()}"
+        f"\nTested contrast: {focal_group} vs {reference_group}"
         f"{interaction_text}")
     ax.grid(axis="y", alpha=0.25)
-    ax.legend(title=group_column, frameon=False, loc="upper right")
+    ax.legend(
+        title=group_column, frameon=False, loc="upper left",
+        bbox_to_anchor=(1.01, 1), borderaxespad=0)
     fig.text(
         0.01, 0.015,
         f"* q < 0.05: within-tissue two-sided Wald z-tests, "
         f"Benjamini–Hochberg FDR across tissues. Omnibus interaction: "
         f"Wald chi-square test ({focal_group} × tissue).",
         ha="left", va="bottom", fontsize=8)
-    fig.tight_layout(rect=(0, 0.055, 1, 1))
+    fig.tight_layout(rect=(0, 0.055, 0.78, 1))
     plt.show()
     return fig, ax
 
