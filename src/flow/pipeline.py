@@ -14,28 +14,15 @@ from statsmodels.stats.multitest import multipletests
 import seaborn as sns
 from statannotations.Annotator import Annotator
 
+from ..shared.palettes import (
+    publication_palette,
+    sex_palette,
+    antibody_status_palette,
+    ANTIBODY_STATUS_COLUMNS,
+)
+
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s - %(levelname)s - %(message)s")
-
-publication_palette = {
-    "Hispanic/Latino": "#1762a4",          # Muted Blue
-    "White": "#bd6319",                    # Muted Orange
-    "Black or African American": "#1cb251",  # Muted Green
-    "Asian": "#97182f"                     # Muted Rose Pink
-}
-sex_palette = {
-    "MALE": "#0c6e97",
-    "FEMALE": "#84109e"  # Muted Orange
-}
-antibody_status_palette = {
-    "Negative": "#009E73",  # Teal
-    "Positive": "#CC79A7",  # Orchid
-    "Not tested": "#8C8C8C",  # Gray
-}
-ANTIBODY_STATUS_COLUMNS = {
-    "Ab CMV:": "CMV_Status",
-    "Ab EBV (IgG):": "EBV_IgG_Status",
-}
 
 
 def _add_antibody_covariates(data):

@@ -1,0 +1,13 @@
+harmonypy
+jupyterlab
+mygene
+numpy
+pandas
+pydeseq2
+scipy
+scanpy
+sccoda
+statsmodels
+tensorflow==2.18.*
+tensorflow-probability[tf]==0.25.*
+tf-keras==2.18.*
